@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:pdfrx/pdfrx.dart';
 
 void main() {
@@ -19,18 +21,129 @@ class MyApp extends StatelessWidget {
 }
 
 // --- Marker model ---
+// Now includes an id from the database
 class Marker {
+  final String commentId; // from database
   final Color color;
   final PdfPageTextRange range;
-  String comment; // mutable so we can edit it
+  String comment;
   final String selectedText;
+  final double rectLeft;
+  final double rectTop;
+  final double rectRight;
+  final double rectBottom;
 
   Marker({
+    required this.commentId,
     required this.color,
     required this.range,
     required this.comment,
     required this.selectedText,
+    required this.rectLeft,
+    required this.rectTop,
+    required this.rectRight,
+    required this.rectBottom,
   });
+}
+
+// --- API Service ---
+// All calls to FastAPI live here
+class CommentApiService {
+  static const String baseUrl = 'http://localhost:8000';
+
+  // CREATE
+  static Future<Map<String, dynamic>?> createComment({
+    required String documentId,
+    required String selectedText,
+    required String comment,
+    required int pageNumber,
+    required double rectLeft,
+    required double rectTop,
+    required double rectRight,
+    required double rectBottom,
+  }) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/comments'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'document_id': documentId,
+        'selected_text': selectedText,
+        'comment': comment,
+        'page_number': pageNumber,
+        'rect_left': rectLeft,
+        'rect_top': rectTop,
+        'rect_right': rectRight,
+        'rect_bottom': rectBottom,
+      }),
+    );
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    }
+    return null;
+  }
+
+  // CREATE REPLY
+  static Future<Map<String, dynamic>?> createReply({
+    required String parentCommentId,
+    required String documentId,
+    required String comment,
+    required int pageNumber,
+  }) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/comments/$parentCommentId/replies'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'document_id': documentId,
+        'selected_text': '',
+        'comment': comment,
+        'page_number': pageNumber,
+        'rect_left': 0,
+        'rect_top': 0,
+        'rect_right': 0,
+        'rect_bottom': 0,
+      }),
+    );
+    if (response.statusCode == 200) return jsonDecode(response.body);
+    return null;
+  }
+
+  // GET REPLIES
+  static Future<List<dynamic>> getReplies(String commentId) async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/comments/$commentId/replies'),
+    );
+    if (response.statusCode == 200) return jsonDecode(response.body);
+    return [];
+  }
+
+  // READ
+  static Future<List<dynamic>> getComments(String documentId) async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/comments/$documentId'),
+    );
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    }
+    return [];
+  }
+
+  // UPDATE
+  static Future<bool> updateComment(String commentId, String newComment) async {
+    final response = await http.put(
+      Uri.parse('$baseUrl/comments/$commentId'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'comment': newComment}),
+    );
+    return response.statusCode == 200;
+  }
+
+  // DELETE
+  static Future<bool> deleteComment(String commentId) async {
+    final response = await http.delete(
+      Uri.parse('$baseUrl/comments/$commentId'),
+    );
+    return response.statusCode == 200;
+  }
 }
 
 class MainPage extends StatefulWidget {
@@ -46,85 +159,126 @@ class _MainPageState extends State<MainPage> {
   List<PdfPageTextRange>? _textSelections;
   bool _isSidebarOpen = false;
   Marker? _hoveredMarker;
+  bool _isLoading = false;
+  List<Map<String, dynamic>> _loadedComments = [];
+  Map<String, List<Map<String, dynamic>>> _replies = {};
+  List<dynamic> _rawComments = []; // Raw comments from API (before PDF is ready to map positions)
+  // The document ID — in real app this comes from your document list
+  // For now we hardcode it to match the S3 URL
+  static const String documentId = 'eab54cd0-6cff-44f4-bd8e-a970abbdcf59';
+
+  @override
+  void initState() {
+    super.initState();
+    // Load comments from database when page opens
+    _loadComments();
+  }
+
+  // --- READ: Load comments from FastAPI on startup ---
+  Future<void> _loadComments() async {
+    setState(() => _isLoading = true);
+
+    final data = await CommentApiService.getComments(documentId);
+
+    setState(() {
+      _rawComments = data;
+      _loadedComments = data.map((e) => Map<String, dynamic>.from(e)).toList();
+      _isLoading = false;
+    });
+
+    await _loadReplies(data); // ADD THIS LINE
+  }
+
+  Future<void> _loadReplies(List<dynamic> comments) async {
+    for (final comment in comments) {
+      final commentId = comment['comment_id'] as String;
+      final replies = await CommentApiService.getReplies(commentId);
+      if (replies.isNotEmpty) {
+        setState(() {
+          _replies[commentId] = replies
+              .map((e) => Map<String, dynamic>.from(e))
+              .toList();
+        });
+      }
+    }
+  }
+
+  Future<void> _onAddReply(Map<String, dynamic> parentComment) async {
+    final comment = await _showCommentDialog(initialComment: '');
+    if (comment == null || comment.isEmpty) return;
+
+    final saved = await CommentApiService.createReply(
+      parentCommentId: parentComment['comment_id'] as String,
+      documentId: documentId,
+      comment: comment,
+      pageNumber: parentComment['page_number'] as int,
+    );
+
+    // if (saved != null) {
+    //   setState(() {
+    //     final parentId = parentComment['comment_id'] as String;
+    //     _replies.putIfAbsent(parentId, () => []).add(
+    //       Map<String, dynamic>.from(saved),
+    //     );
+    //   });
+    // }
+    if (saved != null) {
+      await _loadComments(); // refresh everything including replies
+    }
+  }
 
   // --- CREATE: Add highlight + comment ---
   Future<void> _onAddHighlight() async {
     if (_textSelections == null || _textSelections!.isEmpty) return;
 
     final selectedText = await controller.textSelectionDelegate.getSelectedText();
-
     final comment = await _showCommentDialog(initialComment: '');
     if (comment == null) return;
 
     for (final selectedRange in _textSelections!) {
-      _markers
-          .putIfAbsent(selectedRange.pageNumber, () => [])
-          .add(Marker(
+      final bounds = selectedRange.bounds;
+
+      // Save to FastAPI
+      final saved = await CommentApiService.createComment(
+        documentId: documentId,
+        selectedText: selectedText,
+        comment: comment,
+        pageNumber: selectedRange.pageNumber,
+        rectLeft: bounds.left,
+        rectTop: bounds.top,
+        rectRight: bounds.right,
+        rectBottom: bounds.bottom,
+      );
+
+      if (saved != null) {
+        _markers.putIfAbsent(selectedRange.pageNumber, () => []).add(
+          Marker(
+            commentId: saved['comment_id'],
             color: Colors.yellow,
             range: selectedRange,
             comment: comment,
             selectedText: selectedText,
-          ));
-    }
-
-    setState(() {});
-
-    if (!_isSidebarOpen) {
-      setState(() => _isSidebarOpen = true);
-    }
-  }
-
-  // --- UPDATE: Edit an existing comment ---
-  Future<void> _onEditComment(Marker marker) async {
-    final updatedComment = await _showCommentDialog(initialComment: marker.comment);
-    if (updatedComment == null) return;
-
-    setState(() {
-      marker.comment = updatedComment;
-    });
-  }
-
-  // --- DELETE: Remove a highlight + comment ---
-  void _onDeleteComment(Marker marker) async {
-    // Show a simple confirmation first
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Delete comment?'),
-        content: const Text('This will remove the highlight and comment permanently.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
+            rectLeft: bounds.left,
+            rectTop: bounds.top,
+            rectRight: bounds.right,
+            rectBottom: bounds.bottom,
           ),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Colors.red),
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-
-    if (confirmed != true) return;
-
-    setState(() {
-      _markers[marker.range.pageNumber]?.remove(marker);
-      // Clean up empty page entries
-      if (_markers[marker.range.pageNumber]?.isEmpty ?? false) {
-        _markers.remove(marker.range.pageNumber);
+        );
       }
-    });
-  }
+    }
 
-  // --- Reusable comment dialog (used for both Create and Update) ---
-  Future<String?> _showCommentDialog({required String initialComment}) async {
+    await _loadComments(); // refresh sidebar
+    if (!_isSidebarOpen) setState(() => _isSidebarOpen = true);
+    
+  }
+  
+  // --- Reusable comment dialog ---
+  Future<String?> _showCommentDialog({required String initialComment}) {
     return showDialog<String>(
       context: context,
       builder: (context) {
         final textController = TextEditingController(text: initialComment);
         final isEditing = initialComment.isNotEmpty;
-
         return AlertDialog(
           title: Text(isEditing ? 'Edit comment' : 'Add a comment'),
           content: TextField(
@@ -151,31 +305,55 @@ class _MainPageState extends State<MainPage> {
     );
   }
 
+  void _showError(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), backgroundColor: Colors.red),
+    );
+  }
+
   // --- Draw yellow highlights on PDF ---
   void _paintMarkers(Canvas canvas, Rect pageRect, PdfPage page) {
+    final paint = Paint()
+      ..color = Colors.yellow.withAlpha(120)
+      ..style = PaintingStyle.fill;
+
+    // Draw in-session highlights (from current session)
     final markers = _markers[page.pageNumber];
-    if (markers == null) return;
+    if (markers != null) {
+      for (final marker in markers) {
+        canvas.drawRect(
+          marker.range.bounds.toRectInDocument(page: page, pageRect: pageRect),
+          paint,
+        );
+      }
+    }
 
-    for (final marker in markers) {
-      final paint = Paint()
-        ..color = marker.color.withAlpha(120)
-        ..style = PaintingStyle.fill;
+    // Draw loaded highlights (from database)
+    for (final raw in _rawComments) {
+      if (raw['page_number'] == page.pageNumber) {
+        // Convert PDF coordinates to screen coordinates
+        final scaleX = pageRect.width / page.width;
+        final scaleY = pageRect.height / page.height;
 
-      canvas.drawRect(
-        marker.range.bounds.toRectInDocument(page: page, pageRect: pageRect),
-        paint,
-      );
+        final rect = Rect.fromLTRB(
+          pageRect.left + raw['rect_left'] * scaleX,
+          pageRect.top + (page.height - raw['rect_top']) * scaleY,
+          pageRect.left + raw['rect_right'] * scaleX,
+          pageRect.top + (page.height - raw['rect_bottom']) * scaleY,
+        );
+
+        canvas.drawRect(rect, paint);
+      }
     }
   }
 
-  // --- Place comment icons + hover popover on each page ---
+  // --- Place comment icons + hover popover ---
   List<Widget> _buildPageOverlays(BuildContext context, Rect pageRect, PdfPage page) {
     final markers = _markers[page.pageNumber];
     if (markers == null) return [];
 
     return markers.map((marker) {
       final rect = marker.range.bounds.toRectInDocument(page: page, pageRect: pageRect);
-
       return Positioned(
         left: rect.right + 4,
         top: rect.top,
@@ -203,8 +381,6 @@ class _MainPageState extends State<MainPage> {
                   child: const Icon(Icons.comment, size: 14, color: Colors.white),
                 ),
               ),
-
-              // Hover popover
               if (_hoveredMarker == marker)
                 Positioned(
                   left: 24,
@@ -257,10 +433,26 @@ class _MainPageState extends State<MainPage> {
 
   // --- Build the right sidebar ---
   Widget _buildSidebar() {
-    final allMarkers = _markers.entries
-        .expand((entry) => entry.value)
-        .toList()
-      ..sort((a, b) => a.range.pageNumber.compareTo(b.range.pageNumber));
+    // Combine in-session markers + loaded comments from database
+    final allMarkers = [
+      // From current session
+      ..._markers.entries.expand((e) => e.value).map((m) => {
+        'comment_id': m.commentId,        // changed from 'id' to 'comment_id'
+        'page_number': m.range.pageNumber,
+        'selected_text': m.selectedText,
+        'comment': m.comment,
+        'parent_comment_id': null, // main comments have no parent
+        'rect_left': m.rectLeft,   // add rect coords for navigation
+        'rect_top': m.rectTop,
+        'rect_right': m.rectRight,
+        'rect_bottom': m.rectBottom,
+        'marker': m,
+      }),
+      // From database (not in current session)
+      ..._loadedComments.where((raw) =>
+        !_markers.values.expand((e) => e).any((m) => m.commentId == raw['comment_id']),
+      ),
+    ]..sort((a, b) => (a['page_number'] as int).compareTo(b['page_number'] as int));
 
     return Container(
       width: 280,
@@ -270,7 +462,6 @@ class _MainPageState extends State<MainPage> {
       ),
       child: Column(
         children: [
-          // Sidebar header
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
             decoration: BoxDecoration(
@@ -295,8 +486,6 @@ class _MainPageState extends State<MainPage> {
               ],
             ),
           ),
-
-          // Comment cards
           Expanded(
             child: allMarkers.isEmpty
                 ? Center(
@@ -325,17 +514,25 @@ class _MainPageState extends State<MainPage> {
     );
   }
 
-  // --- Individual comment card with Edit + Delete ---
-  Widget _buildCommentCard(Marker marker) {
+  // --- Individual comment card ---
+  Widget _buildCommentCard(Map<String, dynamic> item) {
+    final isLoaded = item['marker'] == null;
+    final marker = item['marker'] as Marker?;
+
     return GestureDetector(
       onTap: () {
-        // Scroll PDF to the highlight
-        final rect = controller.calcRectForRectInsidePage(
-          pageNumber: marker.range.pageNumber,
-          rect: marker.range.bounds,
-        );
-        controller.ensureVisible(rect);
-      },
+          final pageNumber = item['page_number'] as int;
+          final rectLeft = (item['rect_left'] ?? 0.0) as double;
+          final rectTop = (item['rect_top'] ?? 0.0) as double;
+          final rectRight = (item['rect_right'] ?? 0.0) as double;
+          final rectBottom = (item['rect_bottom'] ?? 0.0) as double;
+
+          final rect = controller.calcRectForRectInsidePage(
+            pageNumber: pageNumber,
+            rect: PdfRect(rectLeft, rectTop, rectRight, rectBottom),
+          );
+          controller.ensureVisible(rect);
+        },
       child: Container(
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
@@ -353,7 +550,6 @@ class _MainPageState extends State<MainPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Top row: page badge + edit + delete buttons
             Row(
               children: [
                 Container(
@@ -363,7 +559,7 @@ class _MainPageState extends State<MainPage> {
                     borderRadius: BorderRadius.circular(4),
                   ),
                   child: Text(
-                    'Page ${marker.range.pageNumber}',
+                    'Page ${item['page_number']}',
                     style: TextStyle(
                       fontSize: 11,
                       color: Colors.yellow.shade800,
@@ -372,30 +568,69 @@ class _MainPageState extends State<MainPage> {
                   ),
                 ),
                 const Spacer(),
-
-                // Edit button
                 IconButton(
                   icon: Icon(Icons.edit_outlined, size: 16, color: Colors.grey.shade500),
                   tooltip: 'Edit comment',
                   padding: EdgeInsets.zero,
                   constraints: const BoxConstraints(),
-                  onPressed: () => _onEditComment(marker),
+                  onPressed: () async {
+                    final updatedComment = await _showCommentDialog(
+                      initialComment: item['comment'] as String,
+                    );
+                    if (updatedComment == null) return;
+
+                    final success = await CommentApiService.updateComment(
+                      item['comment_id'] as String,
+                      updatedComment,
+                    );
+                    if (success) {
+                      setState(() {
+                        item['comment'] = updatedComment;
+                        if (marker != null) marker.comment = updatedComment;
+                      });
+                    }
+                  },
                 ),
                 const SizedBox(width: 8),
-
-                // Delete button
                 IconButton(
                   icon: Icon(Icons.delete_outline, size: 16, color: Colors.red.shade300),
                   tooltip: 'Delete comment',
                   padding: EdgeInsets.zero,
                   constraints: const BoxConstraints(),
-                  onPressed: () => _onDeleteComment(marker),
+                  onPressed: () async {
+                    final confirmed = await showDialog<bool>(
+                      context: context,
+                      builder: (_) => AlertDialog(
+                        title: const Text('Delete comment?'),
+                        content: const Text('This will remove the highlight and comment permanently.'),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(context, false),
+                            child: const Text('Cancel'),
+                          ),
+                          FilledButton(
+                            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+                            onPressed: () => Navigator.pop(context, true),
+                            child: const Text('Delete'),
+                          ),
+                        ],
+                      ),
+                    );
+                    if (confirmed != true) return;
+
+                    final commentId = item['comment_id'] as String;
+                    final success = await CommentApiService.deleteComment(commentId);
+                    if (success) {
+                      if (marker != null) {
+                        setState(() => _markers[marker.range.pageNumber]?.remove(marker));
+                      }
+                      await _loadComments(); // refresh everything
+                    }
+                  },
                 ),
               ],
             ),
             const SizedBox(height: 8),
-
-            // Highlighted text with left yellow border
             Container(
               padding: const EdgeInsets.all(6),
               decoration: BoxDecoration(
@@ -404,7 +639,7 @@ class _MainPageState extends State<MainPage> {
                 border: Border(left: BorderSide(color: Colors.yellow.shade600, width: 3)),
               ),
               child: Text(
-                '"${marker.selectedText}"',
+                '"${item['selected_text']}"',
                 style: TextStyle(
                   fontStyle: FontStyle.italic,
                   fontSize: 12,
@@ -414,20 +649,119 @@ class _MainPageState extends State<MainPage> {
                 overflow: TextOverflow.ellipsis,
               ),
             ),
-
-            // Comment text
-            if (marker.comment.isNotEmpty) ...[
+            if ((item['comment'] as String).isNotEmpty) ...[
               const SizedBox(height: 8),
-              Text(marker.comment, style: const TextStyle(fontSize: 13)),
-            ] else ...[
-              const SizedBox(height: 8),
-              Text(
-                'No comment added.',
-                style: TextStyle(fontSize: 12, color: Colors.grey.shade400, fontStyle: FontStyle.italic),
-              ),
+              Text(item['comment'], style: const TextStyle(fontSize: 13)),
             ],
+
+            // Show existing replies
+            if (_replies[item['comment_id']] != null)
+              ..._replies[item['comment_id']]!
+                  .map((r) => _buildReplyCard(r))
+                  .toList(),
+
+            // Reply button
+            if (item['parent_comment_id'] == null)
+              TextButton.icon(
+                onPressed: () => _onAddReply(item),
+                icon: Icon(Icons.reply, size: 14, color: Colors.grey.shade500),
+                label: Text(
+                  'Reply',
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+                ),
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                ),
+              ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildReplyCard(Map<String, dynamic> reply) {
+    return Container(
+      margin: const EdgeInsets.only(left: 16, top: 6),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.grey.shade50,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.grey.shade200),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.subdirectory_arrow_right, size: 14, color: Colors.grey.shade400),
+              const SizedBox(width: 4),
+              Text(
+                'Reply',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: Colors.grey.shade500,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const Spacer(),
+              // Edit reply
+              IconButton(
+                icon: Icon(Icons.edit_outlined, size: 14, color: Colors.grey.shade400),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+                onPressed: () async {
+                  final updated = await _showCommentDialog(
+                    initialComment: reply['comment'] as String,
+                  );
+                  if (updated == null) return;
+                  final success = await CommentApiService.updateComment(
+                    reply['comment_id'] as String,
+                    updated,
+                  );
+                  if (success) setState(() => reply['comment'] = updated);
+                },
+              ),
+              const SizedBox(width: 6),
+              // Delete reply
+              IconButton(
+                icon: Icon(Icons.delete_outline, size: 14, color: Colors.red.shade200),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+                onPressed: () async {
+                  final confirmed = await showDialog<bool>(
+                    context: context,
+                    builder: (_) => AlertDialog(
+                      title: const Text('Delete reply?'),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(context, false),
+                          child: const Text('Cancel'),
+                        ),
+                        FilledButton(
+                          style: FilledButton.styleFrom(backgroundColor: Colors.red),
+                          onPressed: () => Navigator.pop(context, true),
+                          child: const Text('Delete'),
+                        ),
+                      ],
+                    ),
+                  );
+                  if (confirmed != true) return;
+                  final success = await CommentApiService.deleteComment(
+                    reply['comment_id'] as String,
+                  );
+                  if (success) {
+                    setState(() {
+                      final parentId = reply['parent_comment_id'] as String;
+                      _replies[parentId]?.remove(reply);
+                    });
+                  }
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(reply['comment'] as String, style: const TextStyle(fontSize: 13)),
+        ],
       ),
     );
   }
@@ -438,6 +772,15 @@ class _MainPageState extends State<MainPage> {
       appBar: AppBar(
         title: const Text('PDF Viewer'),
         actions: [
+          if (_isLoading)
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            ),
           IconButton(
             icon: const Icon(Icons.border_color),
             tooltip: 'Highlight + Comment',
@@ -454,14 +797,12 @@ class _MainPageState extends State<MainPage> {
         children: [
           Expanded(
             child: PdfViewer.uri(
-              
               Uri.parse(
                 'https://wybr-edms.s3.ap-southeast-1.amazonaws.com/eab54cd0-6cff-44f4-bd8e-a970abbdcf59.pdf',
               ),
               controller: controller,
               params: PdfViewerParams(
 
-                
                 loadingBannerBuilder: (context, bytesDownloaded, totalBytes) {
                   return Center(
                     child: CircularProgressIndicator(
@@ -471,11 +812,13 @@ class _MainPageState extends State<MainPage> {
                     ),
                   );
                 },
+
                 textSelectionParams: PdfTextSelectionParams(
                   onTextSelectionChange: (textSelection) async {
                     _textSelections = await textSelection.getSelectedTextRanges();
                   },
                 ),
+
                 pagePaintCallbacks: [_paintMarkers],
                 pageOverlaysBuilder: (context, pageRect, page) {
                   return _buildPageOverlays(context, pageRect, page);
@@ -497,7 +840,6 @@ class _MainPageState extends State<MainPage> {
               ),
             ),
           ),
-
           // Toggleable sidebar
           AnimatedSize(
             duration: const Duration(milliseconds: 250),
