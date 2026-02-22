@@ -1,21 +1,42 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:pdfrx/pdfrx.dart';
-
+import 'package:go_router/go_router.dart';
+import 'package:flutter_web_plugins/url_strategy.dart';
+import 'package:url_launcher/url_launcher.dart';
 void main() {
+  usePathUrlStrategy();
   runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
+  static final _router = GoRouter(
+    routerNeglect: true,
+    routes: [
+      GoRoute(
+        path: '/',
+        builder: (context, state) => const MainPage(),
+      ),
+      GoRoute(
+        path: '/share/:token',
+        builder: (context, state) {
+          final token = state.pathParameters['token']!;
+          return ExternalViewerPage(token: token);
+        },
+      ),
+    ],
+  );
+
   @override
   Widget build(BuildContext context) {
-    return const MaterialApp(
+    return MaterialApp.router(
       debugShowCheckedModeBanner: false,
       title: 'Pdfrx example',
-      home: MainPage(),
+      routerConfig: _router,
     );
   }
 }
@@ -144,6 +165,26 @@ class CommentApiService {
     );
     return response.statusCode == 200;
   }
+
+  // GENERATE SHARE LINK
+static Future<Map<String, dynamic>?> createShareLink(String documentId) async {
+  final response = await http.post(
+    Uri.parse('$baseUrl/documents/share'),
+    headers: {'Content-Type': 'application/json'},
+    body: jsonEncode({'document_id': documentId}),
+  );
+  if (response.statusCode == 200) return jsonDecode(response.body);
+  return null;
+}
+
+// VALIDATE SHARE LINK
+static Future<Map<String, dynamic>?> validateShareLink(String token) async {
+  final response = await http.get(
+    Uri.parse('$baseUrl/share/$token'),
+  );
+  if (response.statusCode == 200) return jsonDecode(response.body);
+  return null;
+}
 }
 
 class MainPage extends StatefulWidget {
@@ -214,14 +255,6 @@ class _MainPageState extends State<MainPage> {
       pageNumber: parentComment['page_number'] as int,
     );
 
-    // if (saved != null) {
-    //   setState(() {
-    //     final parentId = parentComment['comment_id'] as String;
-    //     _replies.putIfAbsent(parentId, () => []).add(
-    //       Map<String, dynamic>.from(saved),
-    //     );
-    //   });
-    // }
     if (saved != null) {
       await _loadComments(); // refresh everything including replies
     }
@@ -308,6 +341,92 @@ class _MainPageState extends State<MainPage> {
   void _showError(String message) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(message), backgroundColor: Colors.red),
+    );
+  }
+
+  Future<void> _onShareDocument() async {
+    final result = await CommentApiService.createShareLink(documentId);
+    if (result == null) {
+      _showError('Failed to generate share link.');
+      return;
+    }
+
+    final token = result['token'];
+    final expiresAt = result['expires_at'];
+    final shareUrl = '${Uri.base.origin}/share/$token';
+
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.share, size: 20),
+            SizedBox(width: 8),
+            Text('Share Document'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Share this link with external viewers:',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.grey.shade100,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: Colors.grey.shade300),
+              ),
+              child: SelectableText(
+                shareUrl,
+                style: const TextStyle(fontSize: 12),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                const Icon(Icons.access_time, size: 14, color: Colors.orange),
+                const SizedBox(width: 4),
+                Text(
+                  'Expires: $expiresAt',
+                  style: const TextStyle(fontSize: 11, color: Colors.orange),
+                ),
+              ],
+            ),
+          ],
+        ),
+        actions: [
+          FilledButton.icon(
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: shareUrl));
+              Navigator.pop(context);
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Link copied!')),
+              );
+            },
+            icon: const Icon(Icons.copy, size: 16),
+            label: const Text('Copy Link'),
+          ),
+          // ADD THIS
+          FilledButton.icon(
+            onPressed: () async {
+              Navigator.pop(context);
+              final uri = Uri.parse(shareUrl);
+              await launchUrl(uri, mode: LaunchMode.externalApplication);
+            },
+            icon: const Icon(Icons.open_in_new, size: 16),
+            label: const Text('Open Link'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
     );
   }
 
@@ -516,7 +635,6 @@ class _MainPageState extends State<MainPage> {
 
   // --- Individual comment card ---
   Widget _buildCommentCard(Map<String, dynamic> item) {
-    final isLoaded = item['marker'] == null;
     final marker = item['marker'] as Marker?;
 
     return GestureDetector(
@@ -781,16 +899,30 @@ class _MainPageState extends State<MainPage> {
                 child: CircularProgressIndicator(strokeWidth: 2),
               ),
             ),
-          IconButton(
-            icon: const Icon(Icons.border_color),
-            tooltip: 'Highlight + Comment',
-            onPressed: _onAddHighlight,
-          ),
-          IconButton(
-            icon: Icon(_isSidebarOpen ? Icons.comment : Icons.comment_outlined),
-            tooltip: _isSidebarOpen ? 'Hide Comments' : 'Show Comments',
-            onPressed: () => setState(() => _isSidebarOpen = !_isSidebarOpen),
-          ),
+            // IconButton(
+            //   icon: const Icon(Icons.open_in_new),
+            //   tooltip: 'Test External Viewer',
+            //   onPressed: () async {
+            //     final uri = Uri.parse('/share/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkb2N1bWVudF9pZCI6ImVhYjU0Y2QwLTZjZmYtNDRmNC1iZDhlLWE5NzBhYmJkY2Y1OSIsImV4cCI6MTc3MTcwMTcxM30.jEmRFDgT-f7xd9meV36TwEz4KQ93U01ZwY8HqKUnAIk');
+            //     await launchUrl(uri, mode: LaunchMode.externalApplication);
+            //   },
+            // ),
+            IconButton(
+              icon: const Icon(Icons.border_color),
+              tooltip: 'Highlight + Comment',
+              onPressed: _onAddHighlight,
+            ),
+            IconButton(
+              icon: Icon(_isSidebarOpen ? Icons.comment : Icons.comment_outlined),
+              tooltip: _isSidebarOpen ? 'Hide Comments' : 'Show Comments',
+              onPressed: () => setState(() => _isSidebarOpen = !_isSidebarOpen),
+            ),
+            IconButton(
+              icon: const Icon(Icons.share),
+              tooltip: 'Share Document',
+              onPressed: _onShareDocument,
+            ),
+
         ],
       ),
       body: Row(
@@ -841,6 +973,331 @@ class _MainPageState extends State<MainPage> {
             ),
           ),
           // Toggleable sidebar
+          AnimatedSize(
+            duration: const Duration(milliseconds: 250),
+            curve: Curves.easeInOut,
+            child: _isSidebarOpen ? _buildSidebar() : const SizedBox.shrink(),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
+// --- External Viewer Page (read only for shared links) ---
+class ExternalViewerPage extends StatefulWidget {
+  final String token;
+  const ExternalViewerPage({super.key, required this.token});
+
+  @override
+  State<ExternalViewerPage> createState() => _ExternalViewerPageState();
+}
+
+class _ExternalViewerPageState extends State<ExternalViewerPage> {
+  bool _isLoading = true;
+  bool _isExpired = false;
+  String? _documentId;
+  List<dynamic> _rawComments = [];
+  Map<String, List<Map<String, dynamic>>> _replies = {};
+  bool _isSidebarOpen = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _validateLink();
+  }
+
+  Future<void> _validateLink() async {
+    final result = await CommentApiService.validateShareLink(widget.token);
+    if (result == null) {
+      setState(() {
+        _isLoading = false;
+        _isExpired = true;
+      });
+      return;
+    }
+
+    final docId = result['document_id'] as String;
+    final comments = await CommentApiService.getComments(docId);
+
+    // Load replies for each comment
+    final repliesMap = <String, List<Map<String, dynamic>>>{};
+    for (final comment in comments) {
+      final commentId = comment['comment_id'] as String;
+      final replies = await CommentApiService.getReplies(commentId);
+      if (replies.isNotEmpty) {
+        repliesMap[commentId] = replies
+            .map((e) => Map<String, dynamic>.from(e))
+            .toList();
+      }
+    }
+
+    setState(() {
+      _documentId = docId;
+      _rawComments = comments;
+      _replies = repliesMap;
+      _isLoading = false;
+    });
+  }
+
+  // Draw highlights on PDF (read only)
+  void _paintMarkers(Canvas canvas, Rect pageRect, PdfPage page) {
+    final paint = Paint()
+      ..color = Colors.yellow.withAlpha(120)
+      ..style = PaintingStyle.fill;
+
+    for (final raw in _rawComments) {
+      if (raw['page_number'] == page.pageNumber) {
+        final scaleX = pageRect.width / page.width;
+        final scaleY = pageRect.height / page.height;
+
+        final rect = Rect.fromLTRB(
+          pageRect.left + raw['rect_left'] * scaleX,
+          pageRect.top + (page.height - raw['rect_top']) * scaleY,
+          pageRect.left + raw['rect_right'] * scaleX,
+          pageRect.top + (page.height - raw['rect_bottom']) * scaleY,
+        );
+
+        canvas.drawRect(rect, paint);
+      }
+    }
+  }
+
+  // Read only sidebar
+  Widget _buildSidebar() {
+    final allComments = _rawComments
+        .map((e) => Map<String, dynamic>.from(e))
+        .toList()
+      ..sort((a, b) => (a['page_number'] as int).compareTo(b['page_number'] as int));
+
+    return Container(
+      width: 280,
+      decoration: BoxDecoration(
+        color: Colors.grey.shade50,
+        border: Border(left: BorderSide(color: Colors.grey.shade300)),
+      ),
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.comment_outlined, size: 18),
+                const SizedBox(width: 8),
+                Text(
+                  'Comments (${allComments.length})',
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                ),
+                const Spacer(),
+                IconButton(
+                  icon: const Icon(Icons.close, size: 18),
+                  onPressed: () => setState(() => _isSidebarOpen = false),
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: allComments.isEmpty
+                ? Center(
+                    child: Text(
+                      'No comments yet.',
+                      style: TextStyle(color: Colors.grey.shade400),
+                    ),
+                  )
+                : ListView.separated(
+                    padding: const EdgeInsets.all(12),
+                    itemCount: allComments.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 8),
+                    itemBuilder: (context, index) {
+                      final item = allComments[index];
+                      return _buildReadOnlyCard(item);
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Read only comment card — no edit/delete/reply buttons
+  Widget _buildReadOnlyCard(Map<String, dynamic> item) {
+    final commentId = item['comment_id'] as String;
+    final itemReplies = _replies[commentId] ?? [];
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.yellow.shade300),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.04),
+            blurRadius: 4,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            decoration: BoxDecoration(
+              color: Colors.yellow.shade100,
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Text(
+              'Page ${item['page_number']}',
+              style: TextStyle(
+                fontSize: 11,
+                color: Colors.yellow.shade800,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.all(6),
+            decoration: BoxDecoration(
+              color: Colors.yellow.shade50,
+              borderRadius: BorderRadius.circular(4),
+              border: Border(left: BorderSide(color: Colors.yellow.shade600, width: 3)),
+            ),
+            child: Text(
+              '"${item['selected_text']}"',
+              style: TextStyle(
+                fontStyle: FontStyle.italic,
+                fontSize: 12,
+                color: Colors.grey.shade700,
+              ),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          if ((item['comment'] as String).isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(item['comment'], style: const TextStyle(fontSize: 13)),
+          ],
+          // Show replies read only
+          ...itemReplies.map((reply) => Container(
+            margin: const EdgeInsets.only(left: 16, top: 6),
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: Colors.grey.shade50,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.grey.shade200),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.subdirectory_arrow_right, size: 14, color: Colors.grey.shade400),
+                const SizedBox(width: 4),
+                Expanded(
+                  child: Text(
+                    reply['comment'] as String,
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                ),
+              ],
+            ),
+          )),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isLoading) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    if (_isExpired || _documentId == null) {
+      return Scaffold(
+        body: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.link_off, size: 64, color: Colors.red.shade300),
+              const SizedBox(height: 16),
+              const Text(
+                'This link has expired',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Please request a new link from the document owner.',
+                style: TextStyle(color: Colors.grey.shade600),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Document Viewer'),
+        actions: [
+          // View Only badge
+          Container(
+            margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: Colors.orange.shade100,
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.visibility, size: 14, color: Colors.orange.shade800),
+                const SizedBox(width: 4),
+                Text(
+                  'View Only',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Colors.orange.shade800,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          // Toggle comments sidebar
+          IconButton(
+            icon: Icon(_isSidebarOpen ? Icons.comment : Icons.comment_outlined),
+            tooltip: 'Comments',
+            onPressed: () => setState(() => _isSidebarOpen = !_isSidebarOpen),
+          ),
+        ],
+      ),
+      body: Row(
+        children: [
+          Expanded(
+            child: PdfViewer.uri(
+              Uri.parse(
+                'https://wybr-edms.s3.ap-southeast-1.amazonaws.com/$_documentId.pdf',
+              ),
+              params: PdfViewerParams(
+                loadingBannerBuilder: (context, bytesDownloaded, totalBytes) {
+                  return Center(
+                    child: CircularProgressIndicator(
+                      value: totalBytes != null ? bytesDownloaded / totalBytes : null,
+                    ),
+                  );
+                },
+                pagePaintCallbacks: [_paintMarkers],
+              ),
+            ),
+          ),
           AnimatedSize(
             duration: const Duration(milliseconds: 250),
             curve: Curves.easeInOut,
