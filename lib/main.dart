@@ -6,6 +6,8 @@ import 'package:pdfrx/pdfrx.dart';
 import 'package:go_router/go_router.dart';
 import 'package:flutter_web_plugins/url_strategy.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+
 void main() {
   usePathUrlStrategy();
   runApp(const MyApp());
@@ -82,6 +84,7 @@ class CommentApiService {
     required double rectTop,
     required double rectRight,
     required double rectBottom,
+    required String username,
   }) async {
     final response = await http.post(
       Uri.parse('$baseUrl/comments'),
@@ -95,6 +98,7 @@ class CommentApiService {
         'rect_top': rectTop,
         'rect_right': rectRight,
         'rect_bottom': rectBottom,
+        'username': username,
       }),
     );
     if (response.statusCode == 200) {
@@ -109,6 +113,7 @@ class CommentApiService {
     required String documentId,
     required String comment,
     required int pageNumber,
+    required String username,
   }) async {
     final response = await http.post(
       Uri.parse('$baseUrl/comments/$parentCommentId/replies'),
@@ -122,6 +127,7 @@ class CommentApiService {
         'rect_top': 0,
         'rect_right': 0,
         'rect_bottom': 0,
+        'username': username,
       }),
     );
     if (response.statusCode == 200) return jsonDecode(response.body);
@@ -149,19 +155,22 @@ class CommentApiService {
   }
 
   // UPDATE
-  static Future<bool> updateComment(String commentId, String newComment) async {
+  static Future<bool> updateComment(String commentId, String newComment, String username) async {
     final response = await http.put(
       Uri.parse('$baseUrl/comments/$commentId'),
       headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({'comment': newComment}),
+      body: jsonEncode({
+        'comment': newComment,
+        'username': username,
+      }),
     );
     return response.statusCode == 200;
   }
 
   // DELETE
-  static Future<bool> deleteComment(String commentId) async {
+  static Future<bool> deleteComment(String commentId, String username) async {
     final response = await http.delete(
-      Uri.parse('$baseUrl/comments/$commentId'),
+      Uri.parse('$baseUrl/comments/$commentId?username=$username'),
     );
     return response.statusCode == 200;
   }
@@ -195,6 +204,9 @@ class MainPage extends StatefulWidget {
 }
 
 class _MainPageState extends State<MainPage> {
+  WebSocketChannel? _wsChannel;
+  List<String> _activeUsers = [];
+  String _username = '';
   final controller = PdfViewerController();
   final Map<int, List<Marker>> _markers = {};
   List<PdfPageTextRange>? _textSelections;
@@ -211,8 +223,198 @@ class _MainPageState extends State<MainPage> {
   @override
   void initState() {
     super.initState();
-    // Load comments from database when page opens
-    _loadComments();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await _showUsernameDialog();
+      await _loadComments();
+      _connectWebSocket();
+    });
+  }
+
+  @override
+  void dispose() {
+    _disconnectWebSocket();
+    super.dispose();
+  }
+
+  void _connectWebSocket() {
+    if (_username.isEmpty) return;
+
+    _wsChannel = WebSocketChannel.connect(
+      Uri.parse('ws://localhost:8000/ws/$_username'),
+    );
+
+    _wsChannel!.stream.listen(
+      (message) {
+        final data = jsonDecode(message);
+        _handleWebSocketMessage(data);
+      },
+      onDone: () {
+        // Reconnect if disconnected
+        Future.delayed(const Duration(seconds: 3), _connectWebSocket);
+      },
+      onError: (error) {
+        Future.delayed(const Duration(seconds: 3), _connectWebSocket);
+      },
+    );
+  }
+
+  // void _handleWebSocketMessage(Map<String, dynamic> data) {
+  //   final type = data['type'] as String;
+  //   final sender = data['sender'] as String?;
+  //   print('WS received: type=$type sender=$sender myUsername=$_username');
+  //   switch (type) {
+  //     case 'user_joined':
+  //     case 'user_left':
+  //       setState(() {
+  //         _activeUsers = List<String>.from(data['active_users']);
+  //       });
+  //       break;
+
+  //     case 'comment_added':
+  //     case 'comment_deleted':
+  //     case 'comment_updated':
+  //     case 'reply_added':
+  //       if (sender != _username) {
+  //         _loadComments();
+  //       }
+  //       break;
+  //   }
+  // }
+
+  void _handleWebSocketMessage(Map<String, dynamic> data) {
+    final type = data['type'] as String;
+    final sender = data['sender'] as String?;
+
+    switch (type) {
+      case 'user_joined':
+      case 'user_left':
+        setState(() {
+          _activeUsers = List<String>.from(data['active_users']);
+        });
+        break;
+
+      case 'comment_added':
+        if (sender != _username) {
+          final newComment = Map<String, dynamic>.from(data['comment']);
+          setState(() {
+            _loadedComments.add(newComment);
+            _rawComments.add(newComment);
+          });
+        }
+        break;
+
+      case 'comment_deleted':
+        if (sender != _username) {
+          final commentId = data['comment_id'] as String;
+          setState(() {
+            _loadedComments.removeWhere((c) => c['comment_id'] == commentId);
+            _rawComments.removeWhere((c) => c['comment_id'] == commentId);
+            _replies.remove(commentId);
+            // Also remove if it's a reply inside a parent
+            for (final parentId in _replies.keys) {
+              _replies[parentId]?.removeWhere((r) => r['comment_id'] == commentId);
+            }
+          });
+        }
+        break;
+
+      case 'comment_updated':
+        if (sender != _username) {
+          final commentId = data['comment_id'] as String;
+          final updatedText = data['updated_comment'] as String;
+          setState(() {
+            // Update in loadedComments
+            for (final c in _loadedComments) {
+              if (c['comment_id'] == commentId) {
+                c['comment'] = updatedText;
+              }
+            }
+            // Update in replies
+            for (final replies in _replies.values) {
+              for (final r in replies) {
+                if (r['comment_id'] == commentId) {
+                  r['comment'] = updatedText;
+                }
+              }
+            }
+          });
+        }
+        break;
+
+      case 'reply_added':
+        if (sender != _username) {
+          final parentId = data['parent_comment_id'] as String;
+          // Just reload replies for that specific parent comment
+          CommentApiService.getReplies(parentId).then((replies) {
+            setState(() {
+              _replies[parentId] = replies
+                  .map((e) => Map<String, dynamic>.from(e))
+                  .toList();
+            });
+          });
+        }
+        break;
+    }
+  }
+
+  void _disconnectWebSocket() {
+    _wsChannel?.sink.close();
+  }
+
+  Future<void> _showUsernameDialog() async {
+    final textController = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      barrierDismissible: false, // can't dismiss without entering name
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.person_outline, size: 20),
+            SizedBox(width: 8),
+            Text('Welcome!'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Enter your name to continue',
+              style: TextStyle(fontSize: 13, color: Colors.grey),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: textController,
+              autofocus: true,
+              decoration: const InputDecoration(
+                hintText: 'e.g. Roan',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.person_outline),
+              ),
+              onSubmitted: (value) {
+                if (value.trim().isNotEmpty) {
+                  Navigator.pop(context, value.trim());
+                }
+              },
+            ),
+          ],
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () {
+              if (textController.text.trim().isNotEmpty) {
+                Navigator.pop(context, textController.text.trim());
+              }
+            },
+            child: const Text('Continue'),
+          ),
+        ],
+      ),
+    );
+
+    if (name != null && name.isNotEmpty) {
+      setState(() => _username = name);
+    }
   }
 
   // --- READ: Load comments from FastAPI on startup ---
@@ -253,6 +455,7 @@ class _MainPageState extends State<MainPage> {
       documentId: documentId,
       comment: comment,
       pageNumber: parentComment['page_number'] as int,
+      username: _username,
     );
 
     if (saved != null) {
@@ -281,6 +484,7 @@ class _MainPageState extends State<MainPage> {
         rectTop: bounds.top,
         rectRight: bounds.right,
         rectBottom: bounds.bottom,
+        username: _username,
       );
 
       if (saved != null) {
@@ -700,6 +904,7 @@ class _MainPageState extends State<MainPage> {
                     final success = await CommentApiService.updateComment(
                       item['comment_id'] as String,
                       updatedComment,
+                      _username,
                     );
                     if (success) {
                       setState(() {
@@ -737,7 +942,7 @@ class _MainPageState extends State<MainPage> {
                     if (confirmed != true) return;
 
                     final commentId = item['comment_id'] as String;
-                    final success = await CommentApiService.deleteComment(commentId);
+                    final success = await CommentApiService.deleteComment(commentId, _username);
                     if (success) {
                       if (marker != null) {
                         setState(() => _markers[marker.range.pageNumber]?.remove(marker));
@@ -835,6 +1040,7 @@ class _MainPageState extends State<MainPage> {
                   final success = await CommentApiService.updateComment(
                     reply['comment_id'] as String,
                     updated,
+                    _username,
                   );
                   if (success) setState(() => reply['comment'] = updated);
                 },
@@ -866,6 +1072,7 @@ class _MainPageState extends State<MainPage> {
                   if (confirmed != true) return;
                   final success = await CommentApiService.deleteComment(
                     reply['comment_id'] as String,
+                    _username,
                   );
                   if (success) {
                     setState(() {
@@ -888,7 +1095,62 @@ class _MainPageState extends State<MainPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('PDF Viewer'),
+        title: Row(
+          children: [
+            const Text('PDF Viewer'),
+            if (_username.isNotEmpty) ...[
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.blue.shade100,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.person, size: 12, color: Colors.blue.shade700),
+                    const SizedBox(width: 4),
+                    Text(
+                      _username,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.blue.shade700,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            // Show active users
+            if (_activeUsers.isNotEmpty) ...[
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.green.shade100,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.circle, size: 8, color: Colors.green.shade700),
+                    const SizedBox(width: 4),
+                    Text(
+                      '${_activeUsers.length} viewing: ${_activeUsers.join(', ')}',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.green.shade700,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ],
+        ),
         actions: [
           if (_isLoading)
             const Padding(
@@ -1001,11 +1263,22 @@ class _ExternalViewerPageState extends State<ExternalViewerPage> {
   List<dynamic> _rawComments = [];
   Map<String, List<Map<String, dynamic>>> _replies = {};
   bool _isSidebarOpen = false;
+  WebSocketChannel? _wsChannel;
+  late String _guestName;
 
   @override
   void initState() {
     super.initState();
+    final randomNum = DateTime.now().millisecondsSinceEpoch % 1000;
+    _guestName = 'Guest $randomNum';
     _validateLink();
+  }
+
+
+  @override
+  void dispose() {
+    _wsChannel?.sink.close();
+    super.dispose();
   }
 
   Future<void> _validateLink() async {
@@ -1038,6 +1311,59 @@ class _ExternalViewerPageState extends State<ExternalViewerPage> {
       _rawComments = comments;
       _replies = repliesMap;
       _isLoading = false;
+    });
+
+    _connectWebSocket();
+  }
+
+  void _connectWebSocket() {
+    _wsChannel = WebSocketChannel.connect(
+      Uri.parse('ws://localhost:8000/ws/$_guestName'),
+    );
+
+    _wsChannel!.stream.listen(
+      (message) {
+        final data = jsonDecode(message);
+        final type = data['type'] as String;
+
+        switch (type) {
+          case 'comment_added':
+          case 'comment_deleted':
+          case 'comment_updated':
+          case 'reply_added':
+            // Reload everything when internal users make changes
+            _reloadComments();
+            break;
+        }
+      },
+      onDone: () {
+        Future.delayed(const Duration(seconds: 3), _connectWebSocket);
+      },
+      onError: (error) {
+        Future.delayed(const Duration(seconds: 3), _connectWebSocket);
+      },
+    );
+  }
+
+  Future<void> _reloadComments() async {
+    if (_documentId == null) return;
+
+    final comments = await CommentApiService.getComments(_documentId!);
+
+    final repliesMap = <String, List<Map<String, dynamic>>>{};
+    for (final comment in comments) {
+      final commentId = comment['comment_id'] as String;
+      final replies = await CommentApiService.getReplies(commentId);
+      if (replies.isNotEmpty) {
+        repliesMap[commentId] = replies
+            .map((e) => Map<String, dynamic>.from(e))
+            .toList();
+      }
+    }
+
+    setState(() {
+      _rawComments = comments;
+      _replies = repliesMap;
     });
   }
 
